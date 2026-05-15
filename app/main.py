@@ -1,58 +1,75 @@
+import json
+import logging
 import os
 import uuid
-import httpx
-import json
-import requests
+from collections.abc import AsyncGenerator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import httpx
+import requests
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import BaseModel
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-import fitz  # PyMuPDF
+from qdrant_client.models import Distance, PointStruct, VectorParams
+import fitz
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-QDRANT_URL      = os.getenv("QDRANT_URL", "http://qdrant:6333")
-OLLAMA_URL      = os.getenv("OLLAMA_URL", "http://ollama:11434")
-NVIDIA_API_KEY  = os.getenv("NVIDIA_API_KEY", "")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("rag_mpm")
+
+QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 COLLECTION_NAME = "mpm_docs"
-EMBED_MODEL     = "nomic-embed-text"
-EMBED_DIM       = 768
-CHUNK_SIZE      = 500
-CHUNK_OVERLAP   = 100
-TOP_K           = 5
+EMBED_MODEL = "nomic-embed-text"
+OLLAMA_CHAT_MODEL = "qwen3.5:0.8b"
+EMBED_DIM = 768
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 100
+TOP_K = 5
 
 UPLOAD_DIR = Path("/uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# ─── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="RAG MPM API",
-    description="RAG система для методологии 3D прогнозирования минерализации",
-    version="1.0.0",
-)
-
-# ─── Qdrant client ────────────────────────────────────────────────────────────
 qdrant = QdrantClient(url=QDRANT_URL)
 
 
-def ensure_collection():
-    """Создать коллекцию в Qdrant если не существует."""
+def ensure_collection() -> None:
     existing = [c.name for c in qdrant.get_collections().collections]
     if COLLECTION_NAME not in existing:
+        logger.info("Creating Qdrant collection %s", COLLECTION_NAME)
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
         )
+    else:
+        logger.debug("Qdrant collection %s already exists", COLLECTION_NAME)
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Startup: QDRANT_URL=%s OLLAMA_URL=%s", QDRANT_URL, OLLAMA_URL)
+    ensure_collection()
+    logger.info("Startup complete, chat model=%s", OLLAMA_CHAT_MODEL)
+    yield
+    logger.info("Shutdown")
+
+
+app = FastAPI(
+    title="RAG MPM API",
+    description="RAG система для методологии 3D прогнозирования минерализации",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
 def extract_text_from_pdf(path: Path) -> str:
-    """Извлечь текст из PDF через PyMuPDF."""
     doc = fitz.open(str(path))
     pages = []
     for page in doc:
@@ -62,7 +79,6 @@ def extract_text_from_pdf(path: Path) -> str:
 
 
 def split_text(text: str, source: str) -> list[dict]:
-    """Разбить текст на чанки с метаданными."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -76,7 +92,6 @@ def split_text(text: str, source: str) -> list[dict]:
 
 
 async def get_embedding(text: str) -> list[float]:
-    """Получить эмбеддинг через Ollama nomic-embed-text."""
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/embeddings",
@@ -87,7 +102,6 @@ async def get_embedding(text: str) -> list[float]:
 
 
 async def search_similar(query: str, top_k: int = TOP_K) -> list[dict]:
-    """Найти похожие чанки в Qdrant."""
     query_vec = await get_embedding(query)
     results = qdrant.search(
         collection_name=COLLECTION_NAME,
@@ -107,7 +121,6 @@ async def search_similar(query: str, top_k: int = TOP_K) -> list[dict]:
 
 
 def build_prompt(query: str, chunks: list[dict]) -> str:
-    """Собрать промпт из запроса и найденных чанков."""
     context = "\n\n---\n\n".join(
         f"[Источник: {c['source']}, чанк {c['chunk_index']}]\n{c['text']}"
         for c in chunks
@@ -121,7 +134,6 @@ def build_prompt(query: str, chunks: list[dict]) -> str:
     )
 
 
-# ─── Pydantic schemas ─────────────────────────────────────────────────────────
 class QueryRequest(BaseModel):
     query: str
     top_k: int = TOP_K
@@ -139,36 +151,25 @@ class EmbedResponse(BaseModel):
     results: list[SearchResult]
 
 
-# ─── Startup ──────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup():
-    ensure_collection()
-
-
-# ─── Endpoint 1: Загрузка PDF ─────────────────────────────────────────────────
-@app.post("/upload", summary="1. Загрузить PDF и добавить в Qdrant")
+@app.post("/upload", summary="Загрузить PDF и добавить в Qdrant")
 async def upload_pdf(file: UploadFile = File(...)):
-    """
-    Загружает PDF, извлекает текст, разбивает на чанки,
-    создаёт эмбеддинги через Ollama и сохраняет в Qdrant.
-    """
     if not file.filename.endswith(".pdf"):
+        logger.warning("Reject upload: not PDF filename=%s", file.filename)
         raise HTTPException(status_code=400, detail="Только PDF файлы")
 
-    # Сохранить файл
     save_path = UPLOAD_DIR / file.filename
     content = await file.read()
     save_path.write_bytes(content)
+    logger.info("Saved PDF bytes=%s path=%s", len(content), save_path)
 
-    # Извлечь текст
     text = extract_text_from_pdf(save_path)
     if not text.strip():
+        logger.error("No text extracted from %s", file.filename)
         raise HTTPException(status_code=422, detail="Не удалось извлечь текст из PDF")
 
-    # Разбить на чанки
     chunks = split_text(text, source=file.filename)
+    logger.info("Split into %s chunks for %s", len(chunks), file.filename)
 
-    # Создать эмбеддинги и загрузить в Qdrant
     points = []
     for chunk in chunks:
         embedding = await get_embedding(chunk["text"])
@@ -180,13 +181,13 @@ async def upload_pdf(file: UploadFile = File(...)):
             )
         )
 
-    # Загружаем батчами по 100
     batch_size = 100
     for i in range(0, len(points), batch_size):
         qdrant.upsert(
             collection_name=COLLECTION_NAME,
             points=points[i : i + batch_size],
         )
+    logger.info("Upserted %s points to Qdrant", len(points))
 
     return {
         "filename": file.filename,
@@ -195,29 +196,23 @@ async def upload_pdf(file: UploadFile = File(...)):
     }
 
 
-# ─── Endpoint 2: Поиск только эмбеддинги ─────────────────────────────────────
-@app.post("/search", response_model=EmbedResponse, summary="2. Поиск через embedding (без LLM)")
+@app.post("/search", response_model=EmbedResponse, summary="Поиск через embedding (без LLM)")
 async def search_embedding(req: QueryRequest):
-    """
-    Ищет релевантные чанки в Qdrant по косинусному сходству.
-    Возвращает top_k наиболее похожих фрагментов без генерации ответа.
-    """
+    logger.info("Search query_len=%s top_k=%s", len(req.query), req.top_k)
     results = await search_similar(req.query, req.top_k)
+    logger.info("Search returned %s hits", len(results))
     return EmbedResponse(query=req.query, results=results)
 
 
-# ─── Endpoint 3: Embedding + Ollama Qwen ─────────────────────────────────────
-@app.post("/ask/ollama", summary="3. RAG с Ollama qwen3:0.6b")
+@app.post("/ask/ollama", summary="RAG с Ollama qwen3.5:0.8b")
 async def ask_ollama(req: QueryRequest):
-    """
-    Поиск релевантных чанков + генерация ответа через Ollama (qwen3:0.6b).
-    Возвращает стриминг ответа.
-    """
     chunks = await search_similar(req.query, req.top_k)
     if not chunks:
+        logger.warning("Ask ollama: no chunks for query")
         raise HTTPException(status_code=404, detail="Ничего не найдено в базе знаний")
 
     prompt = build_prompt(req.query, chunks)
+    sources = [{"source": c["source"], "score": round(c["score"], 4)} for c in chunks]
 
     async def stream_ollama() -> AsyncGenerator[str, None]:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -225,7 +220,7 @@ async def ask_ollama(req: QueryRequest):
                 "POST",
                 f"{OLLAMA_URL}/api/generate",
                 json={
-                    "model": "qwen3:0.6b",
+                    "model": OLLAMA_CHAT_MODEL,
                     "prompt": prompt,
                     "stream": True,
                     "options": {"temperature": 0.15, "top_p": 1.0},
@@ -243,38 +238,32 @@ async def ask_ollama(req: QueryRequest):
                         except json.JSONDecodeError:
                             continue
 
-    # Метаданные источников
-    sources = [{"source": c["source"], "score": round(c["score"], 4)} for c in chunks]
-
-    async def full_stream():
-        # Сначала отдаём метаданные
-        yield json.dumps({"sources": sources, "model": "qwen3:0.6b"}) + "\n"
+    async def full_stream() -> AsyncGenerator[str, None]:
+        yield json.dumps({"sources": sources, "model": OLLAMA_CHAT_MODEL}) + "\n"
         yield "data: "
         async for token in stream_ollama():
             yield token
         yield "\n"
 
+    logger.info("Streaming ollama response model=%s", OLLAMA_CHAT_MODEL)
     return StreamingResponse(full_stream(), media_type="text/plain")
 
 
-# ─── Endpoint 4: Embedding + NVIDIA Mistral ───────────────────────────────────
-@app.post("/ask/nvidia", summary="4. RAG с NVIDIA Mistral Large")
+@app.post("/ask/nvidia", summary="RAG с NVIDIA Mistral Large")
 async def ask_nvidia(req: QueryRequest):
-    """
-    Поиск релевантных чанков + генерация через NVIDIA API
-    (mistralai/mistral-large-3-675b-instruct-2512) со стримингом.
-    """
     if not NVIDIA_API_KEY:
+        logger.error("NVIDIA_API_KEY missing")
         raise HTTPException(status_code=500, detail="NVIDIA_API_KEY не задан")
 
     chunks = await search_similar(req.query, req.top_k)
     if not chunks:
+        logger.warning("Ask nvidia: no chunks for query")
         raise HTTPException(status_code=404, detail="Ничего не найдено в базе знаний")
 
     prompt = build_prompt(req.query, chunks)
     sources = [{"source": c["source"], "score": round(c["score"], 4)} for c in chunks]
 
-    def stream_nvidia() -> AsyncGenerator[str, None]:
+    def stream_nvidia() -> Iterator[str]:
         headers = {
             "Authorization": f"Bearer {NVIDIA_API_KEY}",
             "Accept": "text/event-stream",
@@ -291,7 +280,6 @@ async def ask_nvidia(req: QueryRequest):
             "stream": True,
         }
 
-        # Сначала метаданные
         yield json.dumps({"sources": sources, "model": "mistral-large-3"}) + "\n"
 
         with requests.post(
@@ -317,38 +305,5 @@ async def ask_nvidia(req: QueryRequest):
                         except (json.JSONDecodeError, KeyError):
                             continue
 
+    logger.info("Streaming nvidia response")
     return StreamingResponse(stream_nvidia(), media_type="text/plain")
-
-
-# ─── Health ───────────────────────────────────────────────────────────────────
-@app.get("/health", summary="Проверка состояния сервисов")
-async def health():
-    status = {"api": "ok", "qdrant": "unknown", "ollama": "unknown"}
-
-    try:
-        qdrant.get_collections()
-        status["qdrant"] = "ok"
-    except Exception as e:
-        status["qdrant"] = f"error: {e}"
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"{OLLAMA_URL}/api/tags")
-            models = [m["name"] for m in r.json().get("models", [])]
-            status["ollama"] = "ok"
-            status["ollama_models"] = models
-    except Exception as e:
-        status["ollama"] = f"error: {e}"
-
-    return status
-
-
-@app.get("/collections", summary="Статистика коллекции Qdrant")
-async def collections_info():
-    info = qdrant.get_collection(COLLECTION_NAME)
-    return {
-        "collection": COLLECTION_NAME,
-        "vectors_count": info.vectors_count,
-        "points_count": info.points_count,
-        "status": info.status,
-    }
