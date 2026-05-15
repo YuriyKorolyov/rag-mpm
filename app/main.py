@@ -103,9 +103,9 @@ async def get_embedding(text: str) -> list[float]:
 
 async def search_similar(query: str, top_k: int = TOP_K) -> list[dict]:
     query_vec = await get_embedding(query)
-    results = qdrant.search(
+    results = qdrant.query_points(
         collection_name=COLLECTION_NAME,
-        query_vector=query_vec,
+        query=query_vec,
         limit=top_k,
         with_payload=True,
     )
@@ -116,7 +116,7 @@ async def search_similar(query: str, top_k: int = TOP_K) -> list[dict]:
             "chunk_index": r.payload["chunk_index"],
             "score": r.score,
         }
-        for r in results
+        for r in results.points
     ]
 
 
@@ -127,7 +127,8 @@ def build_prompt(query: str, chunks: list[dict]) -> str:
     )
     return (
         "Ты — научный ассистент по методологии 3D прогнозирования минерализации (MPM). "
-        "Отвечай точно и по делу, опираясь только на предоставленный контекст.\n\n"
+        "Отвечай точно и по делу, опираясь только на предоставленный контекст. "
+        "ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ.\n\n"
         f"Контекст:\n{context}\n\n"
         f"Вопрос: {query}\n\n"
         "Ответ:"
@@ -221,7 +222,7 @@ async def ask_ollama(req: QueryRequest):
                 f"{OLLAMA_URL}/api/generate",
                 json={
                     "model": OLLAMA_CHAT_MODEL,
-                    "prompt": prompt,
+                    "prompt": f"\\no_think {prompt}",
                     "stream": True,
                     "options": {"temperature": 0.15, "top_p": 1.0},
                 },
@@ -283,11 +284,11 @@ async def ask_nvidia(req: QueryRequest):
         yield json.dumps({"sources": sources, "model": "mistral-large-3"}) + "\n"
 
         with requests.post(
-            "https://integrate.api.nvidia.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            stream=True,
-            timeout=120,
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                stream=True,
+                timeout=120,
         ) as response:
             response.raise_for_status()
             for line in response.iter_lines():
@@ -299,9 +300,11 @@ async def ask_nvidia(req: QueryRequest):
                             break
                         try:
                             data = json.loads(data_str)
-                            delta = data["choices"][0]["delta"]
-                            if content := delta.get("content"):
-                                yield content
+                            # Проверка как в официальном коде
+                            if "choices" in data and len(data["choices"]) > 0:
+                                delta = data["choices"][0].get("delta", {})
+                                if content := delta.get("content"):
+                                    yield content
                         except (json.JSONDecodeError, KeyError):
                             continue
 
