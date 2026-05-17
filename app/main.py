@@ -28,7 +28,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 COLLECTION_NAME = "mpm_docs"
 EMBED_MODEL = "nomic-embed-text"
-OLLAMA_CHAT_MODEL = "qwen3.5:0.8b"
+OLLAMA_CHAT_MODEL = "sorc/qwen3.5-instruct:0.8b"
 EMBED_DIM = 768
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
@@ -222,7 +222,7 @@ async def ask_ollama(req: QueryRequest):
                 f"{OLLAMA_URL}/api/generate",
                 json={
                     "model": OLLAMA_CHAT_MODEL,
-                    "prompt": f"\\no_think {prompt}",
+                    "prompt": prompt,
                     "stream": True,
                     "options": {"temperature": 0.15, "top_p": 1.0},
                 },
