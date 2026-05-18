@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 import fitz
+from sentence_transformers import SentenceTransformer
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -27,9 +28,11 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 COLLECTION_NAME = "mpm_docs"
+COLLECTION_NAME_ROBERTA = "mpm_docs_roberta"  # отдельная коллекция для RoBERTa
 EMBED_MODEL = "nomic-embed-text"
 OLLAMA_CHAT_MODEL = "sorc/qwen3.5-instruct:0.8b"
 EMBED_DIM = 768
+ROBERTA_EMBED_DIM = 1024  # размерность ai-forever/ru-en-RoSBERTa
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 TOP_K = 5
@@ -39,8 +42,14 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 qdrant = QdrantClient(url=QDRANT_URL)
 
+# Загружаем модель RoBERTa (один раз при старте)
+logger.info("Loading RoBERTa model from Hugging Face...")
+roberta_model = SentenceTransformer("ai-forever/ru-en-RoSBERTa")
+logger.info("RoBERTa model loaded successfully")
+
 
 def ensure_collection() -> None:
+    # Обычная коллекция для nomic-embed-text
     existing = [c.name for c in qdrant.get_collections().collections]
     if COLLECTION_NAME not in existing:
         logger.info("Creating Qdrant collection %s", COLLECTION_NAME)
@@ -50,6 +59,16 @@ def ensure_collection() -> None:
         )
     else:
         logger.debug("Qdrant collection %s already exists", COLLECTION_NAME)
+
+    # Коллекция для RoBERTa
+    if COLLECTION_NAME_ROBERTA not in existing:
+        logger.info("Creating Qdrant collection %s", COLLECTION_NAME_ROBERTA)
+        qdrant.create_collection(
+            collection_name=COLLECTION_NAME_ROBERTA,
+            vectors_config=VectorParams(size=ROBERTA_EMBED_DIM, distance=Distance.COSINE),
+        )
+    else:
+        logger.debug("Qdrant collection %s already exists", COLLECTION_NAME_ROBERTA)
 
 
 @asynccontextmanager
@@ -101,10 +120,36 @@ async def get_embedding(text: str) -> list[float]:
         return resp.json()["embedding"]
 
 
+def get_roberta_embedding(text: str) -> list[float]:
+    """Получение эмбеддинга через RoBERTa (синхронно)"""
+    embedding = roberta_model.encode(text, normalize_embeddings=True)
+    return embedding.tolist()
+
+
 async def search_similar(query: str, top_k: int = TOP_K) -> list[dict]:
     query_vec = await get_embedding(query)
     results = qdrant.query_points(
         collection_name=COLLECTION_NAME,
+        query=query_vec,
+        limit=top_k,
+        with_payload=True,
+    )
+    return [
+        {
+            "text": r.payload["text"],
+            "source": r.payload["source"],
+            "chunk_index": r.payload["chunk_index"],
+            "score": r.score,
+        }
+        for r in results.points
+    ]
+
+
+def search_similar_roberta(query: str, top_k: int = TOP_K) -> list[dict]:
+    """Поиск с использованием эмбеддингов RoBERTa (синхронно)"""
+    query_vec = get_roberta_embedding(query)
+    results = qdrant.query_points(
+        collection_name=COLLECTION_NAME_ROBERTA,
         query=query_vec,
         limit=top_k,
         with_payload=True,
@@ -171,6 +216,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     chunks = split_text(text, source=file.filename)
     logger.info("Split into %s chunks for %s", len(chunks), file.filename)
 
+    # Сохраняем в обычную коллекцию (nomic-embed-text)
     points = []
     for chunk in chunks:
         embedding = await get_embedding(chunk["text"])
@@ -186,22 +232,50 @@ async def upload_pdf(file: UploadFile = File(...)):
     for i in range(0, len(points), batch_size):
         qdrant.upsert(
             collection_name=COLLECTION_NAME,
-            points=points[i : i + batch_size],
+            points=points[i: i + batch_size],
         )
-    logger.info("Upserted %s points to Qdrant", len(points))
+    logger.info("Upserted %s points to Qdrant (%s)", len(points), COLLECTION_NAME)
+
+    # Сохраняем в коллекцию RoBERTa
+    points_roberta = []
+    for chunk in chunks:
+        embedding = get_roberta_embedding(chunk["text"])
+        points_roberta.append(
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=embedding,
+                payload=chunk,
+            )
+        )
+
+    for i in range(0, len(points_roberta), batch_size):
+        qdrant.upsert(
+            collection_name=COLLECTION_NAME_ROBERTA,
+            points=points_roberta[i: i + batch_size],
+        )
+    logger.info("Upserted %s points to Qdrant (%s)", len(points_roberta), COLLECTION_NAME_ROBERTA)
 
     return {
         "filename": file.filename,
         "chunks_created": len(chunks),
-        "message": f"Успешно загружено {len(chunks)} чанков в Qdrant",
+        "message": f"Успешно загружено {len(chunks)} чанков в обе коллекции",
     }
 
 
-@app.post("/search", response_model=EmbedResponse, summary="Поиск через embedding (без LLM)")
+@app.post("/search", response_model=EmbedResponse, summary="Поиск через embedding (nomic-embed-text)")
 async def search_embedding(req: QueryRequest):
     logger.info("Search query_len=%s top_k=%s", len(req.query), req.top_k)
     results = await search_similar(req.query, req.top_k)
     logger.info("Search returned %s hits", len(results))
+    return EmbedResponse(query=req.query, results=results)
+
+
+@app.post("/search/roberta", response_model=EmbedResponse, summary="Поиск через RoBERTa (ai-forever/ru-en-RoSBERTa)")
+async def search_roberta(req: QueryRequest):
+    """Поиск с использованием модели ai-forever/ru-en-RoSBERTa из Hugging Face"""
+    logger.info("RoBERTa search query_len=%s top_k=%s", len(req.query), req.top_k)
+    results = search_similar_roberta(req.query, req.top_k)
+    logger.info("RoBERTa search returned %s hits", len(results))
     return EmbedResponse(query=req.query, results=results)
 
 
@@ -218,14 +292,14 @@ async def ask_ollama(req: QueryRequest):
     async def stream_ollama() -> AsyncGenerator[str, None]:
         async with httpx.AsyncClient(timeout=120.0) as client:
             async with client.stream(
-                "POST",
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": OLLAMA_CHAT_MODEL,
-                    "prompt": prompt,
-                    "stream": True,
-                    "options": {"temperature": 0.15, "top_p": 1.0},
-                },
+                    "POST",
+                    f"{OLLAMA_URL}/api/generate",
+                    json={
+                        "model": OLLAMA_CHAT_MODEL,
+                        "prompt": prompt,
+                        "stream": True,
+                        "options": {"temperature": 0.15, "top_p": 1.0},
+                    },
             ) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
@@ -300,7 +374,6 @@ async def ask_nvidia(req: QueryRequest):
                             break
                         try:
                             data = json.loads(data_str)
-                            # Проверка как в официальном коде
                             if "choices" in data and len(data["choices"]) > 0:
                                 delta = data["choices"][0].get("delta", {})
                                 if content := delta.get("content"):
